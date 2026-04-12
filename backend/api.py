@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import time
+import hashlib
 
 from backend.chatbot_engine import ChatbotEngine
 
@@ -39,6 +40,17 @@ DIST_INDEX = os.path.join(DIST_DIR, "index.html")
 DIST_ASSETS_DIR = os.path.join(DIST_DIR, "assets")
 DIST_FAVICON = os.path.join(DIST_DIR, "favicon.ico")
 FAVICON_PATH = os.path.join(STATIC_DIR, "favicon.ico")
+LEGACY_INDEX = os.path.join(WEB_DIR, "index.html")
+WEB_ENABLE_LEGACY_FALLBACK = os.getenv("WEB_ENABLE_LEGACY_FALLBACK", "0").lower() in {"1", "true", "yes"}
+MAINT_USERS_FILE = os.path.join(BASE_DIR, "runtime_data", "maintenance_users.json")
+ENABLE_BACKEND_DEMO_LOGIN = os.getenv("ENABLE_BACKEND_DEMO_LOGIN", "1").lower() not in {"0", "false", "no"}
+BACKEND_DEMO_ACCOUNT = {
+    "employee_code": os.getenv("DEMO_EMPLOYEE_CODE", "DEMO001"),
+    "password": os.getenv("DEMO_PASSWORD", "123456"),
+    "full_name": os.getenv("DEMO_FULL_NAME", "Kỹ thuật viên Demo"),
+    "department": os.getenv("DEMO_DEPARTMENT", "Trung tâm bảo trì"),
+    "role": os.getenv("DEMO_ROLE", "maintenance_demo"),
+}
 
 CV_SERVICE_BASE_URL = os.getenv("CV_SERVICE_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
 CV_REQUEST_TIMEOUT = float(os.getenv("CV_REQUEST_TIMEOUT", "3.0"))
@@ -86,6 +98,111 @@ def _dir_exists(path: str) -> bool:
         return os.path.isdir(path)
     except Exception:
         return False
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+
+def _build_backend_demo_user() -> Dict[str, Any]:
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "employee_code": BACKEND_DEMO_ACCOUNT["employee_code"],
+        "password_hash": _sha256_text(BACKEND_DEMO_ACCOUNT["password"]),
+        "full_name": BACKEND_DEMO_ACCOUNT["full_name"],
+        "department": BACKEND_DEMO_ACCOUNT["department"],
+        "role": BACKEND_DEMO_ACCOUNT["role"],
+        "source": "backend_demo_local",
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _sanitize_user_profile(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(user, dict):
+        return None
+    return {
+        "employee_code": user.get("employee_code"),
+        "employee_id": user.get("employee_code"),
+        "full_name": user.get("full_name") or user.get("employee_name") or user.get("employee_code"),
+        "employee_name": user.get("full_name") or user.get("employee_name") or user.get("employee_code"),
+        "department": user.get("department") or "Kỹ thuật",
+        "role": user.get("role") or "technician",
+        "source": user.get("source") or "backend_local",
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
+    }
+
+
+def _load_maintenance_users() -> List[Dict[str, Any]]:
+    users = []
+    try:
+        if _file_exists(MAINT_USERS_FILE):
+            with open(MAINT_USERS_FILE, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if isinstance(payload, list):
+                users = [item for item in payload if isinstance(item, dict)]
+    except Exception:
+        users = []
+
+    if ENABLE_BACKEND_DEMO_LOGIN:
+        demo_user = _build_backend_demo_user()
+        if not any((item.get("employee_code") or "").strip().upper() == demo_user["employee_code"].strip().upper() for item in users):
+            users.insert(0, demo_user)
+    return users
+
+
+def _save_maintenance_users(users: List[Dict[str, Any]]) -> None:
+    _ensure_parent_dir(MAINT_USERS_FILE)
+    with open(MAINT_USERS_FILE, "w", encoding="utf-8") as fh:
+        json.dump(users, fh, ensure_ascii=False, indent=2)
+
+
+def _find_maintenance_user(employee_code: str) -> Optional[Dict[str, Any]]:
+    code = (employee_code or "").strip().upper()
+    if not code:
+        return None
+    for user in _load_maintenance_users():
+        if (user.get("employee_code") or "").strip().upper() == code:
+            return user
+    return None
+
+
+def _build_auth_session(user: Dict[str, Any]) -> Dict[str, Any]:
+    profile = _sanitize_user_profile(user) or {}
+    profile.update({
+        "login_mode": "backend_local",
+        "logged_in_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+    return profile
+
+
+def _serve_main_ui_response():
+    if _file_exists(DIST_INDEX):
+        return FileResponse(DIST_INDEX)
+    if WEB_ENABLE_LEGACY_FALLBACK and _file_exists(LEGACY_INDEX):
+        return FileResponse(LEGACY_INDEX)
+    detail = {
+        "error": "Frontend dist not found",
+        "message": "Khong tim thay gui/web/dist/index.html. Hay build frontend React roi copy dist sang backend. UI cu da bi tat mac dinh de tranh chay nham runtime.",
+        "dist_index": DIST_INDEX,
+        "legacy_available": _file_exists(LEGACY_INDEX),
+        "legacy_enabled": WEB_ENABLE_LEGACY_FALLBACK,
+        "legacy_url": "/legacy" if _file_exists(LEGACY_INDEX) else None,
+    }
+    return JSONResponse(status_code=503, content=detail)
+
+
+def _serve_legacy_ui_response():
+    if _file_exists(LEGACY_INDEX):
+        return FileResponse(LEGACY_INDEX)
+    return JSONResponse(status_code=404, content={"error": "Legacy UI not found"})
 
 
 def get_local_ip() -> str:
@@ -433,15 +550,16 @@ def print_ui_links(port: int = 8000):
     print(f"Local UI  : http://127.0.0.1:{port}/")
     print(f"LAN UI    : http://{lan_ip}:{port}/")
     print(f"Health    : http://{lan_ip}:{port}/health")
-    print(f"Customer  : http://{lan_ip}:{port}/pages/assistant.html")
-    print(f"Maint     : http://{lan_ip}:{port}/pages/maintenance.html")
+    print(f"Assistant : http://{lan_ip}:{port}/pages/assistant.html")
+    print(f"Legacy UI : http://{lan_ip}:{port}/legacy")
     print(f"CV base   : {CV_SERVICE_BASE_URL}")
     print(f"DB host   : {DB_HOST}:{DB_PORT}")
     print(f"DB user   : {DB_USER}")
+    print(f"Legacy fallback enabled: {WEB_ENABLE_LEGACY_FALLBACK}")
     if _file_exists(DIST_INDEX):
         print("Frontend  : React dist dang duoc uu tien tai /")
     else:
-        print("Frontend  : Chua thay dist/index.html, co the dang fallback UI cu")
+        print("Frontend  : Chua thay dist/index.html. / se tra ve loi ro rang thay vi tu dong roi vao UI cu.")
     print("============================================\n")
 
 
@@ -475,12 +593,12 @@ def favicon():
 
 @app.get("/", include_in_schema=False)
 def home():
-    if _file_exists(DIST_INDEX):
-        return FileResponse(DIST_INDEX)
-    old_index = os.path.join(WEB_DIR, "index.html")
-    if _file_exists(old_index):
-        return FileResponse(old_index)
-    return JSONResponse(status_code=404, content={"error": "UI not found"})
+    return _serve_main_ui_response()
+
+
+@app.get("/legacy", include_in_schema=False)
+def legacy_home():
+    return _serve_legacy_ui_response()
 
 
 @app.get("/pages/{page}", include_in_schema=False)
@@ -722,6 +840,65 @@ def register_face(req: RegisterFaceRequest):
         raise HTTPException(status_code=500, detail={"message": "Khong the dang ky khuon mat.", "upstream_error": last_upstream_error, "db_error": str(exc)})
 
 
+class MaintenanceLoginRequest(BaseModel):
+    employee_code: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
+class MaintenanceRegisterRequest(BaseModel):
+    employee_code: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+    full_name: str = Field(..., min_length=1)
+    department: Optional[str] = None
+    role: Optional[str] = "technician"
+
+
+def _register_maintenance_user(req: MaintenanceRegisterRequest) -> Dict[str, Any]:
+    employee_code = req.employee_code.strip()
+    if _find_maintenance_user(employee_code):
+        raise HTTPException(status_code=409, detail="Mã nhân viên đã tồn tại.")
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    user = {
+        "employee_code": employee_code,
+        "password_hash": _sha256_text(req.password),
+        "full_name": req.full_name.strip(),
+        "department": (req.department or "Kỹ thuật").strip() or "Kỹ thuật",
+        "role": (req.role or "technician").strip() or "technician",
+        "source": "backend_local_file",
+        "created_at": now,
+        "updated_at": now,
+    }
+    users = _load_maintenance_users()
+    users.append(user)
+    _save_maintenance_users(users)
+    return {"ok": True, "mode": "backend_local_file", "user": _sanitize_user_profile(user)}
+
+
+def _login_maintenance_user(req: MaintenanceLoginRequest) -> Dict[str, Any]:
+    user = _find_maintenance_user(req.employee_code)
+    if not user or user.get("password_hash") != _sha256_text(req.password):
+        raise HTTPException(status_code=401, detail="Sai tài khoản hoặc mật khẩu.")
+    return {
+        "ok": True,
+        "mode": user.get("source") or "backend_local_file",
+        "user": _sanitize_user_profile(user),
+        "session": _build_auth_session(user),
+    }
+
+
+@app.post("/api/integration/users/login")
+@app.post("/api/maintenance/login")
+def maintenance_login(req: MaintenanceLoginRequest):
+    return _login_maintenance_user(req)
+
+
+@app.post("/api/integration/users/register")
+@app.post("/api/maintenance/register")
+def maintenance_register(req: MaintenanceRegisterRequest):
+    return _register_maintenance_user(req)
+
+
 class DataRowSaveRequest(BaseModel):
     database: str
     table: str
@@ -848,11 +1025,6 @@ def reload_knowledge():
 
 @app.get("/{full_path:path}", include_in_schema=False)
 def spa_fallback(full_path: str):
-    if full_path.startswith(("api", "chat", "health", "static", "assets", "pages")):
+    if full_path.startswith(("api", "chat", "health", "static", "assets", "pages", "legacy")):
         return JSONResponse(status_code=404, content={"error": "Not found"})
-    if _file_exists(DIST_INDEX):
-        return FileResponse(DIST_INDEX)
-    old_index = os.path.join(WEB_DIR, "index.html")
-    if _file_exists(old_index):
-        return FileResponse(old_index)
-    return JSONResponse(status_code=404, content={"error": "UI not found"})
+    return _serve_main_ui_response()

@@ -15,6 +15,7 @@ let eventsBound = false;
 let currentDataTab = "mysql";
 let dataExpanded = false;
 let maintChatBusy = false;
+let legacyMaintAuthed = false;
 
 function showDash(on) {
   if (dom.maintLogin) dom.maintLogin.style.display = on ? "none" : "block";
@@ -76,7 +77,13 @@ function bindMaintEvents() {
 }
 
 export function initMaint() {
-  showDash(localStorage.getItem("maint_authed") === "1");
+  legacyMaintAuthed = false;
+  try {
+    localStorage.removeItem("maint_authed");
+    localStorage.removeItem("maint_emp_code");
+    localStorage.removeItem("maint_profile");
+  } catch {}
+  showDash(false);
   switchDataTab(currentDataTab);
   setExpandState(false);
   setChatState(false);
@@ -93,13 +100,23 @@ export function maintenanceLogin() {
     return;
   }
 
-  localStorage.setItem("maint_authed", "1");
+  legacyMaintAuthed = true;
+  try {
+    localStorage.removeItem("maint_authed");
+    localStorage.removeItem("maint_emp_code");
+    localStorage.removeItem("maint_profile");
+  } catch {}
   showDash(true);
-  toast("Đăng nhập bảo trì thành công");
+  toast("Đăng nhập bảo trì thành công (phiên tạm thời, không tự ghi nhớ)");
 }
 
 export function maintenanceLogout() {
-  localStorage.removeItem("maint_authed");
+  legacyMaintAuthed = false;
+  try {
+    localStorage.removeItem("maint_authed");
+    localStorage.removeItem("maint_emp_code");
+    localStorage.removeItem("maint_profile");
+  } catch {}
   showDash(false);
   setChatState(false);
   setExpandState(false);
@@ -155,3 +172,5 @@ export async function sendMaintChat() {
     if (dom.maintChatSend) dom.maintChatSend.disabled = false;
   }
 }
+
+

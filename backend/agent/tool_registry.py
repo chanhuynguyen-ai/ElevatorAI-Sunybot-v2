@@ -14,6 +14,7 @@ from backend.employee_service import (
 )
 from backend.ollama_service import FALLBACK_TEXT, OllamaService
 from backend.semantic_matcher import SemanticMatcher
+from backend.text_utils import normalize_vi
 
 try:
     import psycopg
@@ -46,6 +47,7 @@ class ToolRegistry:
         self.pg_user = os.getenv("PGUSER", os.getenv("DB_USER", "elevator_ai"))
         self.pg_password = os.getenv("PGPASSWORD", os.getenv("DB_PASSWORD", "elevator123"))
         self.cv_db_name = os.getenv("ELEVATOR_CV_DB_NAME", "elevator_cv")
+        self.overload_threshold = int(os.getenv("OVERLOAD_THRESHOLD", "4"))
 
         self._tools = {
             "employee_lookup": self.tool_employee_lookup,
@@ -53,11 +55,14 @@ class ToolRegistry:
             "get_elevator_status": self.tool_get_elevator_status,
             "call_elevator": self.tool_call_elevator,
             "get_cv_status": self.tool_get_cv_status,
+            "get_current_cv_occupancy": self.tool_get_current_cv_occupancy,
             "get_recent_cv_events": self.tool_get_recent_cv_events,
             "get_today_fall_count": self.tool_get_today_fall_count,
             "get_peak_hour": self.tool_get_peak_hour,
             "get_daily_density": self.tool_get_daily_density,
             "get_latest_person_seen": self.tool_get_latest_person_seen,
+            "get_event_summary": self.tool_get_event_summary,
+            "get_priority_alerts": self.tool_get_priority_alerts,
             "answer_cv_query": self.tool_answer_cv_query,
             "general_llm": self.tool_general_llm,
         }
@@ -127,6 +132,9 @@ class ToolRegistry:
                 return value
         return value
 
+    def _citation(self, source: str, content: str, score: float = 1.0) -> List[Dict[str, Any]]:
+        return [{"source": source, "content": content[:600], "score": score}]
+
     def tool_employee_lookup(self, query: str) -> Dict[str, Any]:
         query = (query or "").strip()
         emp = None
@@ -195,11 +203,7 @@ class ToolRegistry:
 
     def tool_get_cv_status(self) -> Dict[str, Any]:
         if not self.cv_db_available:
-            return {
-                "ok": False,
-                "source": "CV_DB",
-                "message": "Chưa có PostgreSQL driver nên chưa đọc được elevator_cv.",
-            }
+            return {"ok": False, "source": "CV_DB", "message": "Chưa có PostgreSQL driver nên chưa đọc được elevator_cv."}
         try:
             with self._cv_connection() as conn:
                 occ = self._fetch_one(
@@ -220,15 +224,23 @@ class ToolRegistry:
                     LIMIT 1
                     """,
                 ) or {}
+            extra = self._safe_json(occ.get("extra")) if occ else {}
+            sitting_count = 0
+            if isinstance(extra, dict):
+                sitting_count = int(extra.get("sitting_count") or 0)
+            people_count = int(occ.get("people_count") or 0)
+            overload = people_count >= self.overload_threshold
             message = (
                 "CV hiện tại: camera {cam_id}, số người {people_count}, người chưa nhận diện {unknown_count}, "
-                "nằm {lying_count}, té ngã {fall_count}."
+                "ngồi {sitting_count}, nằm {lying_count}, té ngã {fall_count}, quá tải {overload}."
             ).format(
                 cam_id=occ.get("cam_id", "cam_01"),
-                people_count=occ.get("people_count", 0),
+                people_count=people_count,
                 unknown_count=occ.get("unknown_count", 0),
+                sitting_count=sitting_count,
                 lying_count=occ.get("lying_count", 0),
                 fall_count=occ.get("fall_count", 0),
+                overload="có" if overload else "không",
             )
             if evt:
                 message += " Event gần nhất: {event_type} lúc {event_ts}.".format(
@@ -238,18 +250,32 @@ class ToolRegistry:
             return {
                 "ok": True,
                 "source": "CV_DB",
-                "status_data": {"occupancy": occ, "latest_event": evt},
+                "status_data": {"occupancy": occ, "latest_event": evt, "overload": overload},
                 "message": message,
+                "citations": self._citation(
+                    "db:elevator_cv.camera_occupancy_samples",
+                    "SELECT cam_id, sample_ts, people_count, unknown_count, lying_count, fall_count, extra FROM camera_occupancy_samples ORDER BY sample_ts DESC LIMIT 1",
+                ),
             }
         except Exception as exc:
             return {"ok": False, "source": "CV_DB", "message": f"Không đọc được CV DB: {exc}"}
 
-    def tool_get_recent_cv_events(
-        self,
-        limit: int = 5,
-        cam_id: Optional[str] = None,
-        event_type: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    def tool_get_current_cv_occupancy(self) -> Dict[str, Any]:
+        status = self.tool_get_cv_status()
+        if not status.get("ok"):
+            return status
+        occupancy = (status.get("status_data") or {}).get("occupancy") or {}
+        people_count = int(occupancy.get("people_count") or 0)
+        overload = bool((status.get("status_data") or {}).get("overload"))
+        return {
+            "ok": True,
+            "source": "CV_DB",
+            "data": occupancy,
+            "message": f"Hiện tại có {people_count} người trước camera CV. Trạng thái quá tải: {'có' if overload else 'không'}.",
+            "citations": status.get("citations", []),
+        }
+
+    def tool_get_recent_cv_events(self, limit: int = 5, cam_id: Optional[str] = None, event_type: Optional[str] = None) -> Dict[str, Any]:
         if not self.cv_db_available:
             return {"ok": False, "source": "CV_DB", "events": [], "message": "Thiếu driver PostgreSQL."}
         try:
@@ -268,7 +294,7 @@ class ToolRegistry:
             for row in rows:
                 row["extra"] = self._safe_json(row.get("extra"))
             if not rows:
-                return {"ok": True, "source": "CV_DB", "events": [], "message": "Chưa có sự kiện CV phù hợp."}
+                return {"ok": True, "source": "CV_DB", "events": [], "message": "Chưa có sự kiện CV phù hợp.", "citations": self._citation("db:elevator_cv.camera_events", sql)}
             bullets = []
             for row in rows[:5]:
                 bullets.append(
@@ -284,6 +310,7 @@ class ToolRegistry:
                 "source": "CV_DB",
                 "events": rows,
                 "message": "Sự kiện CV gần nhất:\n" + "\n".join(bullets),
+                "citations": self._citation("db:elevator_cv.camera_events", sql),
             }
         except Exception as exc:
             return {"ok": False, "source": "CV_DB", "events": [], "message": f"Lỗi đọc camera_events: {exc}"}
@@ -306,6 +333,7 @@ class ToolRegistry:
                 "source": "CV_DB",
                 "total": total,
                 "message": f"Hôm nay có {total} sự kiện té ngã{label}.",
+                "citations": self._citation("db:elevator_cv.camera_events", sql),
             }
         except Exception as exc:
             return {"ok": False, "source": "CV_DB", "message": f"Lỗi đếm sự kiện FALL: {exc}"}
@@ -314,23 +342,20 @@ class ToolRegistry:
         if not self.cv_db_available:
             return {"ok": False, "source": "CV_DB", "message": "Thiếu driver PostgreSQL."}
         try:
+            sql = """
+                SELECT EXTRACT(HOUR FROM sample_ts) AS hour_slot,
+                       AVG(people_count)::float AS avg_people,
+                       MAX(people_count) AS peak_people
+                FROM camera_occupancy_samples
+                WHERE cam_id = %s AND sample_ts >= NOW() - (%s || ' day')::interval
+                GROUP BY hour_slot
+                ORDER BY avg_people DESC, peak_people DESC
+                LIMIT 1
+            """
             with self._cv_connection() as conn:
-                row = self._fetch_one(
-                    conn,
-                    """
-                    SELECT EXTRACT(HOUR FROM sample_ts) AS hour_slot,
-                           AVG(people_count)::float AS avg_people,
-                           MAX(people_count) AS peak_people
-                    FROM camera_occupancy_samples
-                    WHERE cam_id = %s AND sample_ts >= NOW() - (%s || ' day')::interval
-                    GROUP BY hour_slot
-                    ORDER BY avg_people DESC, peak_people DESC
-                    LIMIT 1
-                    """,
-                    (cam_id, int(days)),
-                )
+                row = self._fetch_one(conn, sql, (cam_id, int(days)))
             if not row:
-                return {"ok": True, "source": "CV_DB", "message": f"Chưa có dữ liệu occupancy cho {cam_id}."}
+                return {"ok": True, "source": "CV_DB", "message": f"Chưa có dữ liệu occupancy cho {cam_id}.", "citations": self._citation("db:elevator_cv.camera_occupancy_samples", sql)}
             return {
                 "ok": True,
                 "source": "CV_DB",
@@ -345,6 +370,7 @@ class ToolRegistry:
                     avg=float(row.get("avg_people", 0.0)),
                     peak=int(row.get("peak_people", 0) or 0),
                 ),
+                "citations": self._citation("db:elevator_cv.camera_occupancy_samples", sql),
             }
         except Exception as exc:
             return {"ok": False, "source": "CV_DB", "message": f"Lỗi tính peak hour: {exc}"}
@@ -353,22 +379,19 @@ class ToolRegistry:
         if not self.cv_db_available:
             return {"ok": False, "source": "CV_DB", "data": [], "message": "Thiếu driver PostgreSQL."}
         try:
+            sql = """
+                SELECT date_trunc('day', sample_ts) AS day,
+                       AVG(people_count)::float AS avg_people,
+                       MAX(people_count) AS peak_people
+                FROM camera_occupancy_samples
+                WHERE cam_id = %s AND sample_ts >= NOW() - (%s || ' day')::interval
+                GROUP BY 1
+                ORDER BY 1 DESC
+            """
             with self._cv_connection() as conn:
-                rows = self._fetch_all(
-                    conn,
-                    """
-                    SELECT date_trunc('day', sample_ts) AS day,
-                           AVG(people_count)::float AS avg_people,
-                           MAX(people_count) AS peak_people
-                    FROM camera_occupancy_samples
-                    WHERE cam_id = %s AND sample_ts >= NOW() - (%s || ' day')::interval
-                    GROUP BY 1
-                    ORDER BY 1 DESC
-                    """,
-                    (cam_id, int(days)),
-                )
+                rows = self._fetch_all(conn, sql, (cam_id, int(days)))
             if not rows:
-                return {"ok": True, "source": "CV_DB", "data": [], "message": f"Chưa có density cho {cam_id}."}
+                return {"ok": True, "source": "CV_DB", "data": [], "message": f"Chưa có density cho {cam_id}.", "citations": self._citation("db:elevator_cv.camera_occupancy_samples", sql)}
             preview = []
             for row in rows[:5]:
                 preview.append(
@@ -383,6 +406,7 @@ class ToolRegistry:
                 "source": "CV_DB",
                 "data": rows,
                 "message": "Mật độ người theo ngày:\n" + "\n".join(preview),
+                "citations": self._citation("db:elevator_cv.camera_occupancy_samples", sql),
             }
         except Exception as exc:
             return {"ok": False, "source": "CV_DB", "data": [], "message": f"Lỗi truy vấn density: {exc}"}
@@ -404,7 +428,7 @@ class ToolRegistry:
             with self._cv_connection() as conn:
                 row = self._fetch_one(conn, sql, tuple(params))
             if not row:
-                return {"ok": True, "source": "CV_DB", "message": "Chưa có người nào được nhận diện trong camera_events."}
+                return {"ok": True, "source": "CV_DB", "message": "Chưa có người nào được nhận diện trong camera_events.", "citations": self._citation("db:elevator_cv.camera_events", sql)}
             return {
                 "ok": True,
                 "source": "CV_DB",
@@ -416,27 +440,104 @@ class ToolRegistry:
                     cam_id=row.get("cam_id", "cam_01"),
                     event_ts=row.get("event_ts", "?"),
                 ),
+                "citations": self._citation("db:elevator_cv.camera_events", sql),
             }
         except Exception as exc:
             return {"ok": False, "source": "CV_DB", "message": f"Lỗi đọc person_name mới nhất: {exc}"}
 
+    def tool_get_event_summary(self, days: int = 1, limit: int = 5) -> Dict[str, Any]:
+        if not self.cv_db_available:
+            return {"ok": False, "source": "CV_DB", "message": "Thiếu driver PostgreSQL."}
+        try:
+            sql = """
+                SELECT event_type, COUNT(*) AS total, MAX(event_ts) AS last_seen
+                FROM camera_events
+                WHERE event_ts >= NOW() - (%s || ' day')::interval
+                GROUP BY event_type
+                ORDER BY total DESC, last_seen DESC
+                LIMIT %s
+            """
+            with self._cv_connection() as conn:
+                rows = self._fetch_all(conn, sql, (int(days), int(limit)))
+            if not rows:
+                return {"ok": True, "source": "CV_DB", "message": "Hôm nay chưa ghi nhận lỗi hoặc cảnh báo nào trong camera_events.", "citations": self._citation("db:elevator_cv.camera_events", sql)}
+            lead = rows[0]
+            summary = ", ".join(f"{r.get('event_type', 'UNKNOWN')}: {int(r.get('total') or 0)}" for r in rows)
+            message = (
+                f"Sự kiện xuất hiện nhiều nhất trong {days} ngày gần đây là {lead.get('event_type', 'UNKNOWN')} "
+                f"với {int(lead.get('total') or 0)} lần. Tổng quan: {summary}."
+            )
+            return {"ok": True, "source": "CV_DB", "data": rows, "message": message, "citations": self._citation("db:elevator_cv.camera_events", sql)}
+        except Exception as exc:
+            return {"ok": False, "source": "CV_DB", "message": f"Lỗi tổng hợp event: {exc}"}
+
+    def tool_get_priority_alerts(self, limit: int = 5) -> Dict[str, Any]:
+        if not self.cv_db_available:
+            return {"ok": False, "source": "CV_DB", "message": "Thiếu driver PostgreSQL."}
+        try:
+            sql = """
+                SELECT event_ts, cam_id, event_type, person_name, confidence, posture
+                FROM camera_events
+                WHERE event_type IN ('FALL', 'LYING', 'OVERLOAD', 'CROWD')
+                ORDER BY CASE event_type
+                    WHEN 'FALL' THEN 1
+                    WHEN 'LYING' THEN 2
+                    WHEN 'OVERLOAD' THEN 3
+                    WHEN 'CROWD' THEN 4
+                    ELSE 5 END,
+                    event_ts DESC
+                LIMIT %s
+            """
+            with self._cv_connection() as conn:
+                rows = self._fetch_all(conn, sql, (int(limit),))
+            if not rows:
+                return {"ok": True, "source": "CV_DB", "message": "Hiện chưa có cảnh báo ưu tiên cao cần xử lý.", "citations": self._citation("db:elevator_cv.camera_events", sql)}
+            bullets = []
+            for row in rows[:5]:
+                bullets.append(
+                    "- {event_type} | {cam_id} | {event_ts}".format(
+                        event_type=row.get("event_type", "UNKNOWN"),
+                        cam_id=row.get("cam_id", "cam_01"),
+                        event_ts=row.get("event_ts", "?"),
+                    )
+                )
+            return {
+                "ok": True,
+                "source": "CV_DB",
+                "data": rows,
+                "message": "Cảnh báo cần ưu tiên xử lý:\n" + "\n".join(bullets),
+                "citations": self._citation("db:elevator_cv.camera_events", sql),
+            }
+        except Exception as exc:
+            return {"ok": False, "source": "CV_DB", "message": f"Lỗi lấy cảnh báo ưu tiên: {exc}"}
+
     def tool_answer_cv_query(self, query: str) -> Dict[str, Any]:
-        text = (query or "").strip().lower()
+        text = normalize_vi(query or "")
         if not text:
             return {"ok": False, "source": "CV_DB", "message": "Thiếu câu hỏi CV."}
 
-        if "te nga" in text or "té ngã" in text or "fall" in text:
-            return self.tool_get_today_fall_count()
-        if "dong nhat" in text or "đông nhất" in text or "peak" in text:
+        if any(token in text for token in ["loi noi bat", "tom tat loi", "su kien noi bat", "xuat hien nhieu", "nhieu nhat"]):
+            return self.tool_get_event_summary(days=1)
+        if any(token in text for token in ["canh bao", "uu tien", "priority", "xu ly truoc"]):
+            return self.tool_get_priority_alerts(limit=5)
+        if any(token in text for token in ["hien tai co bao nhieu nguoi", "bao nhieu nguoi hien tai", "so nguoi hien tai", "qua tai hien tai", "trang thai cv hien tai", "cv hien tai"]):
+            return self.tool_get_current_cv_occupancy()
+        if any(token in text for token in ["te nga", "fall"]):
+            if any(token in text for token in ["bao nhieu", "so lan", "count", "hom nay"]):
+                return self.tool_get_today_fall_count()
+            return self.tool_get_priority_alerts(limit=5)
+        if any(token in text for token in ["su kien gan", "event gan", "gan nhat", "moi nhat", "recent event"]):
+            return self.tool_get_recent_cv_events(limit=5)
+        if any(token in text for token in ["dong nhat", "peak"]):
             return self.tool_get_peak_hour()
-        if "mat do" in text or "mật độ" in text or "density" in text:
+        if any(token in text for token in ["mat do", "density"]):
             return self.tool_get_daily_density()
-        if "nguoi gan nhat" in text or "người gần nhất" in text or "latest person" in text or "nhan dien" in text:
+        if any(token in text for token in ["nguoi gan nhat", "latest person", "nhan dien"]):
             return self.tool_get_latest_person_seen()
-        return self.tool_get_recent_cv_events(limit=5)
+        return self.tool_get_event_summary(days=1)
 
     def tool_get_elevator_status(self, elevator_id: int = 1) -> Dict[str, Any]:
-        people_count = 4
+        people_count = 0
         cv_source = "SIMULATED"
         cv_status = self.tool_get_cv_status()
         if cv_status.get("ok"):
@@ -471,29 +572,24 @@ class ToolRegistry:
                 status["people_count"],
                 "có" if status["overload"] else "không",
             ),
+            "citations": cv_status.get("citations", []),
         }
 
-    def tool_call_elevator(
-        self,
-        elevator_id: int = 1,
-        from_floor: Optional[int] = None,
-        target_floor: Optional[int] = None,
-        direction: str = "up",
-    ) -> Dict[str, Any]:
-        if from_floor is None:
-            return {
-                "ok": False,
-                "source": "COMMAND",
-                "message": "Bạn cần chỉ rõ tầng gọi thang, ví dụ: gọi thang tại tầng 3.",
-            }
+    def tool_call_elevator(self, elevator_id: int = 1, from_floor: Optional[int] = None, target_floor: Optional[int] = None, direction: str = "up") -> Dict[str, Any]:
+        if from_floor is None and target_floor is None:
+            return {"ok": False, "source": "COMMAND", "message": "Bạn cần chỉ rõ tầng gọi thang hoặc tầng đích, ví dụ: gọi thang tại tầng 3 hoặc đưa tôi tới tầng 7."}
 
-        from_floor = int(from_floor)
+        from_floor = int(from_floor) if from_floor is not None else None
         target_floor = int(target_floor) if target_floor is not None else None
-        eta = max(8, abs(from_floor - 5) * 4)
+        anchor_floor = from_floor if from_floor is not None else 5
+        eta = max(8, abs((target_floor or anchor_floor) - anchor_floor) * 4)
         command_id = uuid.uuid4().hex[:10]
-        suffix = ""
-        if target_floor is not None:
-            suffix = " Mục tiêu dự kiến là tầng {0}.".format(target_floor)
+
+        if target_floor is not None and from_floor is None:
+            message = f"[Mô phỏng] Đã tạo lệnh đưa thang máy {int(elevator_id)} tới tầng {target_floor}. ETA dự kiến khoảng {eta} giây."
+        else:
+            suffix = f" Mục tiêu dự kiến là tầng {target_floor}." if target_floor is not None else ""
+            message = f"[Mô phỏng] Đã tạo lệnh gọi thang máy {int(elevator_id)} tại tầng {from_floor} theo hướng {direction}. ETA dự kiến khoảng {eta} giây.{suffix}"
 
         return {
             "ok": True,
@@ -507,33 +603,17 @@ class ToolRegistry:
                 "eta_seconds": eta,
                 "mode": "SIMULATED",
             },
-            "message": (
-                "[Mô phỏng] Đã tạo lệnh gọi thang máy {0} tại tầng {1} theo hướng {2}. "
-                "ETA dự kiến khoảng {3} giây.{4}"
-            ).format(int(elevator_id), from_floor, direction, eta, suffix),
+            "message": message,
         }
 
-    def tool_general_llm(
-        self,
-        query: str,
-        context_blocks: Optional[List[str]] = None,
-        memory_summary: str = "",
-        intent_hint: str = "general",
-    ) -> Dict[str, Any]:
+    def tool_general_llm(self, query: str, context_blocks: Optional[List[str]] = None, memory_summary: str = "", intent_hint: str = "general", persona: str = "customer_assistant") -> Dict[str, Any]:
         answer = self.ollama.chat(
             query,
             context_blocks=context_blocks or [],
             memory_summary=memory_summary,
             intent_hint=intent_hint,
+            persona=persona,
         )
         if answer == FALLBACK_TEXT:
-            return {
-                "ok": False,
-                "source": "LLM",
-                "message": FALLBACK_TEXT,
-            }
-        return {
-            "ok": True,
-            "source": "LLM",
-            "message": answer,
-        }
+            return {"ok": False, "source": "LLM", "message": FALLBACK_TEXT}
+        return {"ok": True, "source": "LLM", "message": answer}

@@ -17,7 +17,13 @@ class AgentRuntime:
         self.safety = SafetyGuardrails()
         self.planner = Planner()
 
-    def run(self, message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+    def run(
+        self,
+        message: str,
+        session_id: Optional[str] = None,
+        scope: str = "customer",
+        persona: str = "customer_assistant",
+    ) -> Dict[str, Any]:
         session_id = session_id or uuid.uuid4().hex
         user_text = (message or "").strip()
         if not user_text:
@@ -29,7 +35,7 @@ class AgentRuntime:
                 session_id=session_id,
             ).dict()
 
-        self.memory.add_turn(session_id, "user", user_text)
+        self.memory.add_turn(session_id, "user", user_text, metadata={"scope": scope, "persona": persona})
         memory_summary = self.memory.build_summary(session_id)
         precheck = self.safety.precheck(user_text)
         if precheck.get("status") == "blocked":
@@ -78,12 +84,15 @@ class AgentRuntime:
 
             started = time.time()
             try:
-                result = self.tools.run(tool_call.tool_name, tool_call.args)
+                args = dict(tool_call.args or {})
+                if tool_call.tool_name == "general_llm":
+                    args.setdefault("persona", persona)
+                result = self.tools.run(tool_call.tool_name, args)
                 duration_ms = int((time.time() - started) * 1000)
                 traces.append(
                     ToolTrace(
                         tool_name=tool_call.tool_name,
-                        args=tool_call.args,
+                        args=args,
                         status="ok" if result.get("ok") else "error",
                         duration_ms=duration_ms,
                         summary=(result.get("message") or "")[:220],
@@ -115,6 +124,7 @@ class AgentRuntime:
             traces=traces,
             citations=citations,
             memory_summary=memory_summary,
+            persona=persona,
         )
         assistant_meta = self._extract_memory_metadata(response, tool_results)
         self.memory.add_turn(session_id, "assistant", response["answer"], metadata=assistant_meta)
@@ -131,6 +141,7 @@ class AgentRuntime:
         traces: List[ToolTrace],
         citations: List[Citation],
         memory_summary: str,
+        persona: str,
     ) -> Dict[str, Any]:
         source = "AGENT"
         answer = "Sunybot hiện chưa có đủ dữ liệu để trả lời chính xác câu hỏi này."
@@ -166,16 +177,19 @@ class AgentRuntime:
                     "context_blocks": context_blocks,
                     "memory_summary": memory_summary,
                     "intent_hint": "knowledge_lookup",
+                    "persona": persona,
                 },
             )
             traces.append(
                 ToolTrace(
                     tool_name="general_llm",
-                    args={"query": user_text},
+                    args={"query": user_text, "persona": persona},
                     status="ok" if llm_result.get("ok") else "error",
                     summary=(llm_result.get("message") or "")[:220],
                 )
             )
+            for item in llm_result.get("citations", []):
+                citations.append(Citation(**item))
             if llm_result.get("ok"):
                 answer = llm_result.get("message") or kb_result.get("message", answer)
                 source = "AGENT"
@@ -202,7 +216,7 @@ class AgentRuntime:
             confidence=round(float(plan_confidence), 3),
             session_id=session_id,
             tool_trace=traces,
-            citations=citations,
+            citations=self._dedupe_citations(citations),
             memory_summary=self.memory.build_summary(session_id),
             requires_human=requires_human,
             status="ok" if precheck.get("status") in [None, "ok", "emergency"] else precheck.get("status", "ok"),

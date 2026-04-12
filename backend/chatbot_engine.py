@@ -7,21 +7,34 @@ from backend.agent.tool_registry import ToolRegistry
 from backend.embedding_service import EmbeddingService
 from backend.ollama_service import OllamaService
 from backend.semantic_matcher import SemanticMatcher
+from backend.text_utils import normalize_vi
 from config.db_config import db
 
 
-CAMERA_KEYWORDS = (
-    "camera", "cam", "cv", "nguoi nga", "té ngã", "te nga", "fall", "lying", "nam",
-    "ngoi", "sitting", "bottle", "crowd", "mat do", "mật độ", "density", "peak hour",
-    "person_id", "person_name", "cam_id", "giam sat", "giám sát", "nhan dien", "nhận diện",
+CUSTOMER_CV_SENSITIVE_KEYWORDS = (
+    "camera", " cam ", "cv", "person_id", "person_name", "cam_id",
+    "nhan dien", "giam sat", "mat do", "density", "peak hour", "peak",
+    "camera event", "su kien camera", "lich su camera", "history camera",
+)
+MAINTENANCE_CV_KEYWORDS = (
+    "camera", "cv", "te nga", "fall", "lying", "bottle", "crowd",
+    "mat do", "density", "peak hour", "peak", "nhan dien", "cam_id",
+    "su kien", "event", "canh bao", "alert", "warning", "uu tien",
+    "noi bat", "hom nay", "bao nhieu lan", "gan nhat", "overload", "qua tai",
+    "loi", "xu ly", "priority",
+)
+SAFETY_FAQ_KEYWORDS = (
+    "te nga nen lam gi", "khi te nga", "mac ket", "ket trong thang",
+    "sos dung de lam gi", "de an toan", "qua tai thi lam gi", "nen lam gi",
 )
 STATUS_KEYWORDS = (
-    "trang thai", "trạng thái", "thang may", "thang máy", "elevator status", "qua tai", "quá tải",
-    "overload", "door", "cua", "cửa", "tang hien tai", "tầng hiện tại", "floor", "status",
+    "trang thai hien tai", "dang o tang", "o tang may", "cua dang mo",
+    "cua dang dong", "hien tai co bao nhieu nguoi", "tinh trang qua tai",
+    "qua tai hien tai", "thang may 1 dang o dau", "thang may dang o dau",
 )
 GREETING_PATTERNS = (
-    r"^\s*(hi|hello|xin chao|xin chào|chao|helo|hey)\b",
-    r"^\s*(cam on|cảm ơn|thanks|thank you)\b",
+    r"^\s*(hi|hello|xin chao|chao|helo|hey)\b",
+    r"^\s*(cam on|thanks|thank you)\b",
 )
 
 
@@ -51,7 +64,7 @@ class ChatbotEngine:
 
     def _normalize_scope(self, scope: Optional[str], persona: Optional[str]) -> str:
         raw = (scope or persona or "customer").strip().lower()
-        if raw in {"maintenance", "maint", "console", "operator", "admin"}:
+        if raw in {"maintenance", "maint", "console", "operator", "admin", "maintenance_console"}:
             return "maintenance"
         return "customer"
 
@@ -61,16 +74,27 @@ class ChatbotEngine:
         return "maintenance_console" if scope == "maintenance" else "customer_assistant"
 
     def _normalize_text(self, text: str) -> str:
-        return " ".join((text or "").strip().lower().split())
+        return normalize_vi(text or "")
 
     def _is_greeting(self, normalized_text: str) -> bool:
         return any(re.search(pattern, normalized_text) for pattern in GREETING_PATTERNS)
 
-    def _looks_like_camera_query(self, normalized_text: str) -> bool:
-        return any(keyword in normalized_text for keyword in CAMERA_KEYWORDS)
+    def _looks_like_customer_cv_sensitive(self, normalized_text: str) -> bool:
+        return any(keyword in normalized_text for keyword in CUSTOMER_CV_SENSITIVE_KEYWORDS)
+
+    def _looks_like_maintenance_cv_query(self, normalized_text: str) -> bool:
+        return any(keyword in normalized_text for keyword in MAINTENANCE_CV_KEYWORDS)
+
+    def _looks_like_safety_faq(self, normalized_text: str) -> bool:
+        return any(keyword in normalized_text for keyword in SAFETY_FAQ_KEYWORDS)
 
     def _looks_like_status_query(self, normalized_text: str) -> bool:
-        return any(keyword in normalized_text for keyword in STATUS_KEYWORDS)
+        if any(keyword in normalized_text for keyword in STATUS_KEYWORDS):
+            return True
+        followups = ("the con", "bay gio", "hien gio", "luc nay")
+        if any(token in normalized_text for token in followups):
+            return "thang may" in normalized_text or "thang" in normalized_text or "elevator" in normalized_text
+        return False
 
     def _make_result(
         self,
@@ -84,6 +108,10 @@ class ChatbotEngine:
         persona: str,
         query_type: str,
         tool_trace: Optional[list] = None,
+        citations: Optional[list] = None,
+        memory_summary: Optional[str] = None,
+        status: str = "ok",
+        requires_human: bool = False,
     ) -> Dict[str, Any]:
         return {
             "answer": answer,
@@ -95,6 +123,10 @@ class ChatbotEngine:
             "persona": persona,
             "query_type": query_type,
             "tool_trace": tool_trace or [],
+            "citations": citations or [],
+            "memory_summary": memory_summary,
+            "status": status,
+            "requires_human": requires_human,
         }
 
     def _handle_empty_message(self, session_id: Optional[str], scope: str, persona: str) -> Dict[str, Any]:
@@ -165,6 +197,7 @@ class ChatbotEngine:
             persona=persona,
             query_type="status",
             tool_trace=[{"tool": "get_elevator_status", "ok": True, "elevator_id": 1, "mode": status.get("mode")}],
+            citations=payload.get("citations", []),
         )
 
     def _handle_maintenance_cv_query(
@@ -192,6 +225,7 @@ class ChatbotEngine:
                     "preview": (tool_result.get("message") or "")[:180],
                 }
             ],
+            citations=tool_result.get("citations", []),
         )
 
     def log_chat(self, result: Dict[str, Any], question: str) -> bool:
@@ -243,7 +277,7 @@ class ChatbotEngine:
             self.log_chat(result, user_text)
             return result
 
-        if normalized_scope == "customer" and self._looks_like_camera_query(normalized_text):
+        if normalized_scope == "customer" and self._looks_like_customer_cv_sensitive(normalized_text) and not self._looks_like_safety_faq(normalized_text):
             result = self._handle_scope_guard(session_id, normalized_scope, normalized_persona)
             self.log_chat(result, user_text)
             return result
@@ -254,17 +288,23 @@ class ChatbotEngine:
                 self.log_chat(status_result, user_text)
                 return status_result
 
-        if normalized_scope == "maintenance" and self._looks_like_camera_query(normalized_text):
+        if normalized_scope == "maintenance" and self._looks_like_maintenance_cv_query(normalized_text):
             result = self._handle_maintenance_cv_query(user_text, session_id, normalized_scope, normalized_persona)
             self.log_chat(result, user_text)
             return result
 
-        result = self.agent.run(user_text, session_id=session_id)
+        result = self.agent.run(
+            user_text,
+            session_id=session_id,
+            scope=normalized_scope,
+            persona=normalized_persona,
+        )
         result["session_id"] = result.get("session_id") or session_id
         result["scope"] = normalized_scope
         result["persona"] = normalized_persona
-        result["query_type"] = "general"
+        result["query_type"] = result.get("query_type") or "general"
         result.setdefault("tool_trace", [])
+        result.setdefault("citations", [])
         self.log_chat(result, user_text)
         return result
 

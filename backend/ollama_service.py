@@ -41,6 +41,14 @@ class OllamaService:
         intent_hint: str = "general",
         persona: str = "customer_assistant",
     ) -> str:
+        if intent_hint == "out_of_domain":
+            return (
+                "Bạn là Sunybot, trợ lý AI cho hệ thống thang máy thông minh.\n"
+                "Câu hỏi hiện tại nằm ngoài phạm vi hỗ trợ.\n"
+                "Hãy trả lời đúng 1 câu, lịch sự, từ chối khéo và nói rằng bạn chỉ hỗ trợ thang máy, an toàn, trạng thái hệ thống và vận hành.\n"
+                f"Câu hỏi người dùng: {user_text}\n"
+            )
+
         context_blocks = context_blocks or []
         context_text = "\n".join("- {0}".format(item) for item in context_blocks if item)
         return (
@@ -51,6 +59,8 @@ class OllamaService:
             "3) Nếu thiếu dữ liệu, hãy nói rõ là chưa đủ dữ liệu thay vì đoán.\n"
             "4) Trả lời ngắn gọn, đúng chuyên môn, bằng tiếng Việt.\n"
             "5) Nếu là câu chào/cảm ơn, trả lời lịch sự và ngắn gọn.\n"
+            "6) Nếu câu hỏi ngoài domain thang máy, hãy từ chối lịch sự và không trả lời kiến thức phổ thông ngoài phạm vi.\n"
+            "7) Nếu người dùng hỏi câu an toàn hoặc hướng dẫn xử lý sự cố theo kiểu FAQ, hãy trả lời như hướng dẫn sử dụng, không coi đó là dữ liệu camera nhạy cảm.\n"
             "\n"
             "{0}"
             "Tín hiệu ý định: {1}\n"

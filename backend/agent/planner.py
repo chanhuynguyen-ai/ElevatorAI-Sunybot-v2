@@ -8,7 +8,9 @@ from backend.text_utils import normalize_vi
 
 class Planner:
     STATUS_KEYWORDS = [
-        "trang thai", "hien tai", "dang o dau", "dang o tang", "qua tai", "mo cua", "dong cua", "status",
+        "trang thai hien tai", "thang dang o tang", "dang o tang may", "o tang may",
+        "cua dang mo", "cua dang dong", "cua dang mo hay dong",
+        "hien tai co bao nhieu nguoi", "qua tai khong", "tinh trang qua tai",
     ]
     CALL_KEYWORDS = [
         "goi thang", "call elevator", "goi cabin", "len tang", "xuong tang", "di tang", "dua toi tang",
@@ -17,11 +19,16 @@ class Planner:
         "nhan vien", "ma nhan vien", "email", "so dien thoai", "phong ban", "thong tin nhan vien", "ho so",
     ]
     KNOWLEDGE_HINTS = [
-        "thang may", "elevator", "sos", "bao tri", "ky thuat", "cabin", "cua", "cam bien", "qua tai",
-        "van hanh", "an toan", "su co", "mat dien", "cuu ho",
+        "thang may", "elevator", "sos", "bao tri", "ky thuat", "cabin", "cam bien", "qua tai",
+        "van hanh", "an toan", "su co", "mat dien", "cuu ho", "cau tao", "nguyen ly",
+        "la gi", "cach su dung", "huong dan", "phai lam gi", "nen lam gi",
     ]
     SMALLTALK_HINTS = [
         "xin chao", "chao", "hello", "hi", "cam on", "tam biet", "ban la ai", "ban lam duoc gi",
+    ]
+    DOMAIN_HINTS = [
+        "thang may", "elevator", "tang", "cabin", "bao tri", "an toan", "sos", "qua tai", "cuu ho",
+        "cam bien", "cua", "ket trong thang", "mac ket",
     ]
     ELEVATOR_RE = re.compile(r"(?:thang may|thang|elevator)\s*(\d+)", re.IGNORECASE)
     EMPLOYEE_CODE_RE = re.compile(r"\b[A-Z]{1,4}\d{2,8}\b")
@@ -37,13 +44,7 @@ class Planner:
             return AgentPlan(
                 intent="employee_lookup",
                 plan=["Tra cứu nhân viên theo mã định danh."],
-                tool_calls=[
-                    ToolCall(
-                        tool_name="employee_lookup",
-                        args={"query": user_text.strip()},
-                        reason="Mã nhân viên hợp lệ",
-                    )
-                ],
+                tool_calls=[ToolCall(tool_name="employee_lookup", args={"query": user_text.strip()}, reason="Mã nhân viên hợp lệ")],
                 confidence=0.99,
             )
 
@@ -52,13 +53,7 @@ class Planner:
             return AgentPlan(
                 intent="employee_lookup",
                 plan=["Tra cứu nhân viên theo mã, tên hoặc mô tả."],
-                tool_calls=[
-                    ToolCall(
-                        tool_name="employee_lookup",
-                        args={"query": query},
-                        reason="Câu hỏi có dấu hiệu tra cứu nhân viên",
-                    )
-                ],
+                tool_calls=[ToolCall(tool_name="employee_lookup", args={"query": query}, reason="Câu hỏi có dấu hiệu tra cứu nhân viên")],
                 confidence=0.93 if self._has_any(norm, self.EMPLOYEE_HINTS) else 0.88,
             )
 
@@ -67,13 +62,7 @@ class Planner:
             return AgentPlan(
                 intent="call_elevator",
                 plan=["Phân tích yêu cầu gọi thang.", "Thực thi tool gọi thang ở chế độ mô phỏng an toàn."],
-                tool_calls=[
-                    ToolCall(
-                        tool_name="call_elevator",
-                        args=args,
-                        reason="Người dùng muốn gọi thang hoặc di chuyển cabin",
-                    )
-                ],
+                tool_calls=[ToolCall(tool_name="call_elevator", args=args, reason="Người dùng muốn gọi thang hoặc di chuyển cabin")],
                 confidence=0.92,
             )
 
@@ -82,57 +71,38 @@ class Planner:
             return AgentPlan(
                 intent="elevator_status",
                 plan=["Lấy trạng thái thang máy gần nhất."],
-                tool_calls=[
-                    ToolCall(
-                        tool_name="get_elevator_status",
-                        args=args,
-                        reason="Câu hỏi về trạng thái thang máy",
-                    )
-                ],
+                tool_calls=[ToolCall(tool_name="get_elevator_status", args=args, reason="Câu hỏi về trạng thái thang máy")],
                 confidence=0.93,
             )
 
         if self._has_any(norm, self.KNOWLEDGE_HINTS):
             return AgentPlan(
                 intent="knowledge_lookup",
-                plan=[
-                    "Tìm kiếm tri thức liên quan trong knowledge base.",
-                    "Nếu có ngữ cảnh phù hợp thì dùng LLM diễn giải bám sát nguồn.",
-                ],
-                tool_calls=[
-                    ToolCall(
-                        tool_name="kb_search",
-                        args={"query": user_text, "top_k": 4},
-                        reason="Câu hỏi nằm trong domain thang máy hoặc vận hành",
-                    )
-                ],
-                confidence=0.82,
+                plan=["Tìm kiếm tri thức liên quan trong knowledge base.", "Nếu có ngữ cảnh phù hợp thì dùng LLM diễn giải bám sát nguồn."],
+                tool_calls=[ToolCall(tool_name="kb_search", args={"query": user_text, "top_k": 4}, reason="Câu hỏi nằm trong domain thang máy hoặc vận hành")],
+                confidence=0.84,
             )
 
         if self._has_any(norm, self.SMALLTALK_HINTS):
             return AgentPlan(
                 intent="general_llm",
                 plan=["Trả lời giao tiếp ngắn gọn, không mở rộng ngoài domain trợ lý."],
-                tool_calls=[
-                    ToolCall(
-                        tool_name="general_llm",
-                        args={"query": user_text, "intent_hint": "smalltalk"},
-                        reason="Câu hỏi giao tiếp cơ bản",
-                    )
-                ],
+                tool_calls=[ToolCall(tool_name="general_llm", args={"query": user_text, "intent_hint": "smalltalk"}, reason="Câu hỏi giao tiếp cơ bản")],
                 confidence=0.72,
+            )
+
+        if not self._has_any(norm, self.DOMAIN_HINTS):
+            return AgentPlan(
+                intent="out_of_domain",
+                plan=["Từ chối lịch sự vì câu hỏi nằm ngoài phạm vi hệ thống thang máy."],
+                tool_calls=[ToolCall(tool_name="general_llm", args={"query": user_text, "intent_hint": "out_of_domain"}, reason="Câu hỏi ngoài domain")],
+                confidence=0.95,
             )
 
         return AgentPlan(
             intent="general_llm",
             plan=["Dùng LLM trả lời thận trọng và từ chối nếu ngoài phạm vi."],
-            tool_calls=[
-                ToolCall(
-                    tool_name="general_llm",
-                    args={"query": user_text, "intent_hint": "general"},
-                    reason="Không khớp tool chuyên biệt",
-                )
-            ],
+            tool_calls=[ToolCall(tool_name="general_llm", args={"query": user_text, "intent_hint": "general"}, reason="Không khớp tool chuyên biệt")],
             confidence=0.58,
         )
 
@@ -140,12 +110,7 @@ class Planner:
         return " ".join(item.get("content", "") for item in history[-4:])
 
     def _context_from_history(self, history: List[dict]) -> Dict[str, object]:
-        ctx: Dict[str, object] = {
-            "employee_code": None,
-            "elevator_id": None,
-            "from_floor": None,
-            "target_floor": None,
-        }
+        ctx: Dict[str, object] = {"employee_code": None, "elevator_id": None, "from_floor": None, "target_floor": None}
         for item in reversed(history):
             text = item.get("content", "")
             meta = item.get("metadata") or {}
@@ -194,7 +159,7 @@ class Planner:
     def _is_status_request(self, norm: str, history_text: str) -> bool:
         if self._has_any(norm, self.STATUS_KEYWORDS):
             return True
-        if "thang may" in norm and any(token in norm for token in ["o dau", "tang may", "cua mo", "cua dong"]):
+        if "thang may" in norm and any(token in norm for token in ["dang o dau", "dang o tang", "tang may", "cua dang mo", "cua dang dong", "bao nhieu nguoi"]):
             return True
         history_norm = normalize_vi(history_text)
         if history_norm and any(token in norm for token in ["con sao", "the con", "bay gio"]):
@@ -222,16 +187,19 @@ class Planner:
         target_floor = None
 
         from_match = re.search(r"(?:tu|tai)\s*(?:tang|floor)\s*(\d+)", norm)
-        to_match = re.search(r"(?:toi|den)\s*(?:tang|floor)\s*(\d+)", norm)
+        to_match = re.search(r"(?:toi|den|len|xuong)\s*(?:tang|floor)\s*(\d+)", norm)
         if from_match:
             from_floor = int(from_match.group(1))
         if to_match:
             target_floor = int(to_match.group(1))
 
-        if from_floor is None and floors:
+        if len(floors) >= 2:
+            from_floor = from_floor if from_floor is not None else floors[0]
+            target_floor = target_floor if target_floor is not None else floors[1]
+        elif len(floors) == 1 and target_floor is None and ("len tang" in norm or "xuong tang" in norm or "toi tang" in norm or "den tang" in norm):
+            target_floor = floors[0]
+        elif len(floors) == 1 and from_floor is None:
             from_floor = floors[0]
-        if target_floor is None and len(floors) > 1:
-            target_floor = floors[1]
 
         if from_floor is None:
             from_floor = ctx.get("from_floor")
